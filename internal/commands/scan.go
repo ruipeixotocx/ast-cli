@@ -2,6 +2,7 @@ package commands
 
 import (
 	"archive/zip"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,6 +32,9 @@ import (
 	"github.com/google/shlex"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
+
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/checkmarx/ast-cli/internal/commands/policymanagement"
@@ -1070,6 +1074,30 @@ func compressFolder(sourceDir, filter, userIncludeFilter, scaResolver string) (s
 		return "", errors.Wrapf(err, "Cannot source code temp file.")
 	}
 	zipWriter := zip.NewWriter(outputFile)
+
+	entries, err := processHistory(sourceDir)
+	if err != nil {
+		return "", err
+	}
+
+	out, err := os.OpenFile(filepath.Join(sourceDir, "history.csv"), os.O_WRONLY|os.O_CREATE, 0600)
+	if err != nil {
+		return "", err
+	}
+	csvWriter := csv.NewWriter(out)
+	for _, item := range entries {
+		csvWriter.Write([]string{item.CommitHash, item.Date, item.Author})
+	}
+	csvWriter.Flush()
+	if csvWriter.Error() != nil {
+		return "", csvWriter.Error()
+	}
+	out.Close()
+
+	delete(commonParams.DisabledExclusions, ".git")
+	commonParams.BaseExcludeFilters = append(commonParams.BaseExcludeFilters, "!.git")
+	commonParams.BaseIncludeFilters = append(commonParams.BaseIncludeFilters, "*.csv")
+
 	err = addDirFiles(zipWriter, "", sourceDir, getExcludeFilters(filter), getIncludeFilters(userIncludeFilter))
 	if err != nil {
 		return "", err
@@ -1091,6 +1119,38 @@ func compressFolder(sourceDir, filter, userIncludeFilter, scaResolver string) (s
 	}
 	logger.PrintIfVerbose(fmt.Sprintf("Zip size:  %.2fMB\n", float64(stat.Size())/mbBytes))
 	return outputFile.Name(), err
+}
+
+type entry struct {
+	CommitHash, Date, Author string
+}
+
+func processHistory(sourceDir string) ([]entry, error) {
+	data := []entry{}
+	repo, err := gogit.PlainOpen(sourceDir)
+	if err != nil {
+		return data, err
+	}
+
+	since := time.Now().AddDate(0, 0, -90)
+	logObj, err := repo.Log(&gogit.LogOptions{Since: &since, Order: gogit.LogOrderCommitterTime})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get commits info from project git info folder")
+	}
+
+	err = logObj.ForEach(func(c *object.Commit) error {
+		author := c.Author.Email
+		date := c.Author.When.Format(time.RFC3339)
+		commitHash := c.Hash.String()
+		data = append(data, entry{CommitHash: commitHash, Date: date, Author: author})
+		return nil
+	})
+
+	if err != nil {
+		return data, err
+	}
+
+	return data, nil
 }
 
 func isSingleContainerScanTriggered() bool {
